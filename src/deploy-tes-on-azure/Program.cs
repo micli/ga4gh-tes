@@ -3,6 +3,7 @@
 
 using System;
 using System.Threading.Tasks;
+using Microsoft.Azure.Management.ResourceManager.Fluent;
 
 namespace TesDeployer
 {
@@ -30,6 +31,12 @@ namespace TesDeployer
             if (!configuration.Silent)
             {
                 PrintWelcomeScreen();
+            }
+
+            if (!AzureEnvironmentExtension.IsEnvironmentNameAvailable(configuration.AzureName))
+            {
+                Console.WriteLine($"Specified cloud {configuration.AzureName} does not exist.");
+                return;
             }
 
             Environment.Exit(await new Deployer(configuration).DeployAsync());
