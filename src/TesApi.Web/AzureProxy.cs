@@ -57,29 +57,26 @@ namespace TesApi.Web
         private readonly string azureOfferDurableId;
         private readonly string batchResourceGroupName;
         private readonly string batchAccountName;
-        private readonly AzureEnvironment azEnv;
+
 
         /// <summary>
         /// The constructor
         /// </summary>
-        /// <param name="azEnv">Azure Environment</param>
         /// <param name="batchAccountName">Batch account name</param>
         /// <param name="azureOfferDurableId">Azure offer id</param>
         /// <param name="logger">The logger</param>
-        public AzureProxy(AzureEnvironment azEnv, string batchAccountName, string azureOfferDurableId, ILogger logger)
+        public AzureProxy(string batchAccountName, string azureOfferDurableId, ILogger logger)
         {
-            this.azEnv = azEnv;
             this.logger = logger;
             this.batchAccountName = batchAccountName;
-            var (SubscriptionId, ResourceGroupName, Location, BatchAccountEndpoint) = FindBatchAccountAsync(this.azEnv, batchAccountName).Result;
+            var (SubscriptionId, ResourceGroupName, Location, BatchAccountEndpoint) = FindBatchAccountAsync(batchAccountName).Result;
             batchResourceGroupName = ResourceGroupName;
             subscriptionId = SubscriptionId;
             location = Location;
-            batchClient = BatchClient.Open(new BatchTokenCredentials($"https://{BatchAccountEndpoint}", () => GetAzureManagementAccessTokenAsync(this.azEnv)));
+            batchClient = BatchClient.Open(new BatchTokenCredentials($"https://{BatchAccountEndpoint}", () => GetAzureAccessTokenAsync("https://batch.core.windows.net/")));
 
-            getBatchAccountFunc = async () =>
-                await new BatchManagementClient(new Uri(this.azEnv.ResourceManagerEndpoint),
-                new TokenCredentials(await GetAzureAccessTokenAsync(this.azEnv))) { SubscriptionId = SubscriptionId }
+            getBatchAccountFunc = async () => 
+                await new BatchManagementClient(new TokenCredentials(await GetAzureAccessTokenAsync())) { SubscriptionId = SubscriptionId }
                     .BatchAccount
                     .GetAsync(ResourceGroupName, batchAccountName);
 
@@ -87,7 +84,7 @@ namespace TesApi.Web
 
             if (! AzureRegionUtils.TryGetBillingRegionName(location, out billingRegionName))
             {
-                logger.LogWarning($"Azure ARM location '{location}' does not have a corresponding Azure Billing Region. Prices from the fallback billing region '{DefaultAzureBillingRegionName}' will be used instead.");
+                logger.LogWarning($"Azure ARM location '{location}' does not have a corresponding Azure Billing Region.  Prices from the fallback billing region '{DefaultAzureBillingRegionName}' will be used instead.");
                 billingRegionName = DefaultAzureBillingRegionName;
             }
         }
@@ -97,15 +94,14 @@ namespace TesApi.Web
         /// <summary>
         /// Gets the Application Insights instrumentation key
         /// </summary>
-        /// <param name="env">Azure Environment</param>
         /// <param name="appInsightsApplicationId">Application Insights application id</param>
         /// <returns>Application Insights instrumentation key</returns>
-        public static async Task<string> GetAppInsightsInstrumentationKeyAsync(AzureEnvironment env, string appInsightsApplicationId)
+        public static async Task<string> GetAppInsightsInstrumentationKeyAsync(string appInsightsApplicationId)
         {
-            var azureClient = await GetAzureManagementClientAsync(env);
+            var azureClient = await GetAzureManagementClientAsync();
             var subscriptionIds = (await azureClient.Subscriptions.ListAsync()).Select(s => s.SubscriptionId);
 
-            var credentials = new TokenCredentials(await GetAzureAccessTokenAsync(env));
+            var credentials = new TokenCredentials(await GetAzureAccessTokenAsync());
 
             foreach (var subscriptionId in subscriptionIds)
             {
@@ -134,7 +130,7 @@ namespace TesApi.Web
         /// <returns>The CosmosDB endpoint and key of the specified account</returns>
         public async Task<(string, string)> GetCosmosDbEndpointAndKeyAsync(string cosmosDbAccountName)
         {
-            var azureClient = await GetAzureManagementClientAsync(this.azEnv);
+            var azureClient = await GetAzureManagementClientAsync();
             var subscriptionIds = (await azureClient.Subscriptions.ListAsync()).Select(s => s.SubscriptionId);
 
             var account = (await Task.WhenAll(subscriptionIds.Select(async subId => await azureClient.WithSubscription(subId).CosmosDBAccounts.ListAsync())))
@@ -293,7 +289,7 @@ namespace TesApi.Web
         /// </summary>
         /// <param name="tesTaskId">The unique TES task ID</param>
         /// <returns>Job state information</returns>
-        [System.Diagnostics.CodeAnalysis.SuppressMessage(@"Performance", "CA1826:Do not use Enumerable methods on indexable collections", Justification = "FirstOrDefault() is straightforward, the alternative is less clear.")]
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1826:Do not use Enumerable methods on indexable collections", Justification = "FirstOrDefault() is straightforward, the alternative is less clear.")]
         public async Task<AzureBatchJobAndTaskState> GetBatchJobAndTaskStateAsync(string tesTaskId)
         {
             try
@@ -541,7 +537,7 @@ namespace TesApi.Web
         /// <returns>List of container registries</returns>
         private async Task<IEnumerable<ContainerRegistryInfo>> GetAccessibleContainerRegistriesAsync()
         {
-            var azureClient = await GetAzureManagementClientAsync(this.azEnv);
+            var azureClient = await GetAzureManagementClientAsync();
             var subscriptionIds = (await azureClient.Subscriptions.ListAsync()).Select(s => s.SubscriptionId);
             var infos = new List<ContainerRegistryInfo>();
             logger.LogInformation(@"GetAccessibleContainerRegistriesAsync() called.");
@@ -565,7 +561,7 @@ namespace TesApi.Web
                         }
                         catch (Exception ex)
                         {
-                            logger.LogWarning($"TES service doesn't have permission to get credentials for registry {r.LoginServerUrl}. Please verify that 'Admin user' is enabled in the 'Access Keys' area in the Azure Portal for this container registry.  Exception: {ex}");
+                            logger.LogWarning($"TES service doesn't have permission to get credentials for registry {r.LoginServerUrl}.  Please verify that 'Admin user' is enabled in the 'Access Keys' area in the Azure Portal for this container registry.  Exception: {ex}");
                         }
                     }
                 }
@@ -585,7 +581,7 @@ namespace TesApi.Web
         /// <returns>List of storage accounts</returns>
         public async Task<IEnumerable<StorageAccountInfo>> GetAccessibleStorageAccountsAsync()
         {
-            var azureClient = await GetAzureManagementClientAsync(this.azEnv);
+            var azureClient = await GetAzureManagementClientAsync();
 
             var subscriptionIds = (await azureClient.Subscriptions.ListAsync()).Select(s => s.SubscriptionId);
 
@@ -606,7 +602,7 @@ namespace TesApi.Web
         {
             try
             {
-                var azureClient = await GetAzureManagementClientAsync(this.azEnv);
+                var azureClient = await GetAzureManagementClientAsync();
                 var storageAccount = await azureClient.WithSubscription(storageAccountInfo.SubscriptionId).StorageAccounts.GetByIdAsync(storageAccountInfo.Id);
 
                 return (await storageAccount.GetKeysAsync())[0].Value;
@@ -716,11 +712,11 @@ namespace TesApi.Web
 
         private async Task<string> GetPricingContentJsonAsync()
         {
-            var pricingUrl = $"{azEnv.ResourceManagerEndpoint}subscriptions/{subscriptionId}/provider/Microsoft.Commerce/RateCard?api-version=2016-08-31-preview&$filter=OfferDurableId eq '{azureOfferDurableId}' and Currency eq 'USD' and Locale eq 'en-US' and RegionInfo eq 'US'";
+            var pricingUrl = $"https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.Commerce/RateCard?api-version=2016-08-31-preview&$filter=OfferDurableId eq '{azureOfferDurableId}' and Currency eq 'USD' and Locale eq 'en-US' and RegionInfo eq 'US'";
 
             try
             {
-                var accessToken = await GetAzureAccessTokenAsync(azEnv);
+                var accessToken = await GetAzureAccessTokenAsync();
                 var pricingRequest = new HttpRequestMessage(HttpMethod.Get, pricingUrl);
                 pricingRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
                 var pricingResponse = await httpClient.SendAsync(pricingRequest);
@@ -767,19 +763,17 @@ namespace TesApi.Web
         {
             static double ConvertMiBToGiB(int value) => Math.Round(value / 1024.0, 2);
 
-            var azureClient = await GetAzureManagementClientAsync(this.azEnv);
+            var azureClient = await GetAzureManagementClientAsync();
 
             var vmSizesAvailableAtLocation = (await azureClient.WithSubscription(subscriptionId).ComputeSkus.ListbyRegionAndResourceTypeAsync(Region.Create(location), ComputeResourceType.VirtualMachines))
                 .Select(vm => new { VmSize = vm.Name.Value, VmFamily = vm.Inner.Family, Capabilities = vm.Capabilities.ToDictionary(c => c.Name, c => c.Value) })
-                .Select(vm => new
-                {
+                .Select(vm => new {
                     VmSize = vm.VmSize,
                     VmFamily = vm.VmFamily,
                     NumberOfCores = int.Parse(vm.Capabilities.GetValueOrDefault("vCPUsAvailable", vm.Capabilities["vCPUs"])),
                     MemoryGiB = double.Parse(vm.Capabilities["MemoryGB"]),
                     DiskGiB = ConvertMiBToGiB(int.Parse(vm.Capabilities["MaxResourceVolumeMB"])),
-                    MaxDataDiskCount = int.Parse(vm.Capabilities.GetValueOrDefault("MaxDataDiskCount", "0"))
-                });
+                    MaxDataDiskCount = int.Parse(vm.Capabilities.GetValueOrDefault("MaxDataDiskCount", "0")) });
 
             IEnumerable<VmPrice> vmPrices;
 
@@ -787,21 +781,12 @@ namespace TesApi.Web
 
             try
             {
-                if (this.azEnv.Name == AzureEnvironment.AzureChinaCloud.Name)
-                {
-                    // It seems Azure China does not support this API, let's leverage local cache directly.
-                    vmPrices = JsonConvert.DeserializeObject<IEnumerable<VmPrice>>(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "DefaultVmPrices.json")));
-                }
-                else
-                {
-                    var pricingContent = await GetPricingContentJsonAsync();
-                    vmPrices = ExtractVmPricesFromRateCardResponse(supportedVmSizes, pricingContent);
-                }
-
+                var pricingContent = await GetPricingContentJsonAsync();
+                vmPrices = ExtractVmPricesFromRateCardResponse(supportedVmSizes, pricingContent);
             }
             catch
             {
-                logger.LogWarning(@"Using default VM prices. Please see: https://github.com/microsoft/CromwellOnAzure/blob/master/docs/troubleshooting-guide.md#dynamic-cost-optimization-and-ratecard-api-access");
+                logger.LogWarning("Using default VM prices. Please see: https://github.com/microsoft/CromwellOnAzure/blob/master/docs/troubleshooting-guide.md#dynamic-cost-optimization-and-ratecard-api-access");
                 vmPrices = JsonConvert.DeserializeObject<IEnumerable<VmPrice>>(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "DefaultVmPrices.json")));
             }
 
@@ -847,20 +832,17 @@ namespace TesApi.Web
             return vmInfos;
         }
 
-        private static Task<string> GetAzureAccessTokenAsync(AzureEnvironment env)
-            => new AzureServiceTokenProvider("RunAs=App", env.AuthenticationEndpoint).GetAccessTokenAsync(env.ResourceManagerEndpoint);
-
-        private static Task<string> GetAzureManagementAccessTokenAsync(AzureEnvironment env)
-            => new AzureServiceTokenProvider("RunAs=App", env.AuthenticationEndpoint).GetAccessTokenAsync(env.ManagementEndpoint);
+        private static Task<string> GetAzureAccessTokenAsync(string resource = "https://management.azure.com/")
+            => new AzureServiceTokenProvider().GetAccessTokenAsync(resource);
 
         /// <summary>
         /// Gets an authenticated Azure Client instance
         /// </summary>
         /// <returns>An authenticated Azure Client instance</returns>
-        private static async Task<FluentAzure.IAuthenticated> GetAzureManagementClientAsync(AzureEnvironment env)
+        private static async Task<FluentAzure.IAuthenticated> GetAzureManagementClientAsync()
         {
-            var accessToken = await GetAzureAccessTokenAsync(env);
-            var azureCredentials = new AzureCredentials(new TokenCredentials(accessToken), null, null, env);
+            var accessToken = await GetAzureAccessTokenAsync();
+            var azureCredentials = new AzureCredentials(new TokenCredentials(accessToken), null, null, AzureEnvironment.AzureGlobalCloud);
             var azureClient = FluentAzure.Authenticate(azureCredentials);
 
             return azureClient;
@@ -901,7 +883,7 @@ namespace TesApi.Web
 
             try
             {
-                var tokenCredentials = new TokenCredentials(await GetAzureAccessTokenAsync(this.azEnv));
+                var tokenCredentials = new TokenCredentials(await GetAzureAccessTokenAsync());
 
                 var vmConfigManagement = new Microsoft.Azure.Management.Batch.Models.VirtualMachineConfiguration(
                     new Microsoft.Azure.Management.Batch.Models.ImageReference(
@@ -918,7 +900,7 @@ namespace TesApi.Web
                     startTask = new Microsoft.Azure.Management.Batch.Models.StartTask
                     {
                         CommandLine = $"/bin/sh {startTaskPath}",
-                        UserIdentity = new Microsoft.Azure.Management.Batch.Models.UserIdentity(null, new Microsoft.Azure.Management.Batch.Models.AutoUserSpecification( elevationLevel: Microsoft.Azure.Management.Batch.Models.ElevationLevel.Admin, scope: Microsoft.Azure.Management.Batch.Models.AutoUserScope.Pool)),
+                        UserIdentity = new Microsoft.Azure.Management.Batch.Models.UserIdentity(null, new Microsoft.Azure.Management.Batch.Models.AutoUserSpecification(elevationLevel: Microsoft.Azure.Management.Batch.Models.ElevationLevel.Admin, scope: Microsoft.Azure.Management.Batch.Models.AutoUserScope.Pool)),
                         ResourceFiles = new List<Microsoft.Azure.Management.Batch.Models.ResourceFile> { new Microsoft.Azure.Management.Batch.Models.ResourceFile(null, null, startTaskSasUrl, null, startTaskPath) }
                     };
                 }
@@ -1015,12 +997,12 @@ namespace TesApi.Web
             }
         }
 
-        private static async Task<(string SubscriptionId, string ResourceGroupName, string Location, string BatchAccountEndpoint)> FindBatchAccountAsync(AzureEnvironment env, string batchAccountName)
+        private static async Task<(string SubscriptionId, string ResourceGroupName, string Location, string BatchAccountEndpoint)> FindBatchAccountAsync(string batchAccountName)
         {
             var resourceGroupRegex = new Regex("/*/resourceGroups/([^/]*)/*");
 
-            var tokenCredentials = new TokenCredentials(await GetAzureAccessTokenAsync(env));
-            var azureClient = await GetAzureManagementClientAsync(env);
+            var tokenCredentials = new TokenCredentials(await GetAzureAccessTokenAsync());
+            var azureClient = await GetAzureManagementClientAsync();
 
             var subscriptionIds = (await azureClient.Subscriptions.ListAsync()).Select(s => s.SubscriptionId);
 

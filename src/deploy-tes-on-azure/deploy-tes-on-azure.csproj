@@ -66,6 +66,9 @@
     <EmbeddedResource Include="scripts\wait-for-it.sh" />
     <EmbeddedResource Include="test.wdl" />
     <EmbeddedResource Include="testInputs.json" />
+    <Content Update="samples\config.json">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <EmbeddedResource Include="scripts\helm\Chart.yaml" />
     <EmbeddedResource Include="scripts\helm\values-template.yaml" />
     <EmbeddedResource Include="scripts\helm\README.md" />
@@ -79,7 +82,4 @@
     <Folder Include="Properties\PublishProfiles\" />
   </ItemGroup>
 
-  <ItemGroup>
-    <None Remove="Microsoft.Azure.Management.ResourceManager.Fluent" />
-  </ItemGroup>
 </Project>
