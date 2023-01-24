@@ -16,7 +16,7 @@ namespace Tes.Repository
     /// A repository for interacting with an Azure Cosmos DB instance
     /// </summary>
     /// <typeparam name="T"></typeparam>
-    public class CosmosDbRepository<T> : IRepository<T> where T : RepositoryItem<T>
+    public sealed class CosmosDbRepository<T> : IRepository<T> where T : RepositoryItem<T>
     {
         private const int MaxAutoScaleThroughput = 4000;
         private readonly CosmosClient cosmosClient;
@@ -35,10 +35,10 @@ namespace Tes.Repository
         public CosmosDbRepository(string endpoint, string key, string databaseId, string containerId, string partitionKeyValue)
         {
             NewtonsoftJsonSafeInit.SetDefaultSettings();
-            this.cosmosClient = new CosmosClient(endpoint, key);
+            this.cosmosClient = new(endpoint, key);
             this.container = cosmosClient.GetContainer(databaseId, containerId);
             this.partitionKeyValue = partitionKeyValue;
-            this.partitionKey = new PartitionKey(partitionKeyValue);
+            this.partitionKey = new(partitionKeyValue);
             CreateDatabaseIfNotExistsAsync().Wait();
             CreateContainerIfNotExistsAsync().Wait();
         }
@@ -142,7 +142,7 @@ namespace Tes.Repository
         private async Task CreateContainerIfNotExistsAsync()
         {
             var database = this.cosmosClient.GetDatabase(container.Database.Id);
-            await database.CreateContainerIfNotExistsAsync(new ContainerProperties { Id = container.Id, PartitionKeyPath = $"/{RepositoryItem<T>.PartitionKeyFieldName}" });
+            await database.CreateContainerIfNotExistsAsync(new() { Id = container.Id, PartitionKeyPath = $"/{RepositoryItem<T>.PartitionKeyFieldName}" });
 
             var existingPartitionKeyPath = (await container.ReadContainerAsync()).Resource.PartitionKeyPath;
 
@@ -155,5 +155,9 @@ namespace Tes.Repository
                 throw new Exception($"Existing CosmosDb container {container.Id} partition key path ({existingPartitionKeyPath}) differs from the requested one (/{RepositoryItem<T>.PartitionKeyFieldName}). Recreate the container.");
             }
         }
+
+        /// <inheritdoc/>
+        public void Dispose()
+            => cosmosClient?.Dispose();
     }
 }

@@ -8,6 +8,8 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Tes.Models;
+using TesApi.Web.Management;
+using TesApi.Web.Management.Models.Quotas;
 
 namespace TesApi.Web
 {
@@ -17,23 +19,47 @@ namespace TesApi.Web
     public class ConfigurationUtils
     {
         private readonly IConfiguration configuration;
-        private readonly IAzureProxy azureProxy;
         private readonly IStorageAccessProvider storageAccessProvider;
-        private readonly ILogger logger;
+        private readonly ILogger<ConfigurationUtils> logger;
+        private readonly IBatchQuotaProvider quotaProvider;
+        private readonly IBatchSkuInformationProvider skuInformationProvider;
+        private readonly BatchAccountResourceInformation batchAccountResourceInformation;
 
         /// <summary>
         /// The constructor
         /// </summary>
         /// <param name="configuration"><see cref="IConfiguration"/></param>
-        /// <param name="azureProxy"><see cref="IAzureProxy"/></param>
         /// <param name="storageAccessProvider"><see cref="IStorageAccessProvider"/></param>
+        /// <param name="quotaProvider"><see cref="IBatchQuotaProvider"/>></param>
+        /// <param name="skuInformationProvider"><see cref="IBatchSkuInformationProvider"/>></param>
+        /// <param name="batchAccountResourceInformation"><see cref="BatchAccountResourceInformation"/></param>
         /// <param name="logger"><see cref="ILogger"/></param>
-        public ConfigurationUtils(IConfiguration configuration, IAzureProxy azureProxy, IStorageAccessProvider storageAccessProvider, ILogger logger)
+        public ConfigurationUtils(
+            IConfiguration configuration,
+            IStorageAccessProvider storageAccessProvider,
+            IBatchQuotaProvider quotaProvider,
+            IBatchSkuInformationProvider skuInformationProvider,
+            BatchAccountResourceInformation batchAccountResourceInformation,
+            ILogger<ConfigurationUtils> logger)
         {
+
+            ArgumentNullException.ThrowIfNull(configuration);
+            ArgumentNullException.ThrowIfNull(storageAccessProvider);
+            ArgumentNullException.ThrowIfNull(quotaProvider);
+            ArgumentNullException.ThrowIfNull(batchAccountResourceInformation);
+            if (string.IsNullOrEmpty(batchAccountResourceInformation.Region))
+            {
+                throw new ArgumentException(
+                    $"The batch information provided does not include region. Batch information:{batchAccountResourceInformation}");
+            }
+            ArgumentNullException.ThrowIfNull(logger);
+
             this.configuration = configuration;
-            this.azureProxy = azureProxy;
             this.storageAccessProvider = storageAccessProvider;
             this.logger = logger;
+            this.quotaProvider = quotaProvider;
+            this.skuInformationProvider = skuInformationProvider;
+            this.batchAccountResourceInformation = batchAccountResourceInformation;
         }
 
         /// <summary>
@@ -47,8 +73,8 @@ namespace TesApi.Web
             var supportedVmSizesFilePath = $"/{defaultStorageAccountName}/configuration/supported-vm-sizes";
             var allowedVmSizesFilePath = $"/{defaultStorageAccountName}/configuration/allowed-vm-sizes";
 
-            var supportedVmSizes = (await azureProxy.GetVmSizesAndPricesAsync()).ToList();
-            var batchAccountQuotas = await azureProxy.GetBatchAccountQuotasAsync();
+            var supportedVmSizes = (await skuInformationProvider.GetVmSizesAndPricesAsync(batchAccountResourceInformation.Region)).ToList();
+            var batchAccountQuotas = await quotaProvider.GetVmCoreQuotaAsync(lowPriority: false);
             var supportedVmSizesFileContent = VirtualMachineInfoToFixedWidthColumns(supportedVmSizes.OrderBy(v => v.VmFamily).ThenBy(v => v.VmSize), batchAccountQuotas);
 
             try
@@ -123,7 +149,7 @@ namespace TesApi.Web
         /// <param name="vmInfos">List of <see cref="VirtualMachineInformation"/></param>
         /// <param name="batchAccountQuotas">Batch quotas <see cref="AzureBatchAccountQuotas"/></param>
         /// <returns></returns>
-        private static string VirtualMachineInfoToFixedWidthColumns(IEnumerable<VirtualMachineInformation> vmInfos, AzureBatchAccountQuotas batchAccountQuotas)
+        private static string VirtualMachineInfoToFixedWidthColumns(IEnumerable<VirtualMachineInformation> vmInfos, BatchVmCoreQuota batchAccountQuotas)
         {
             var vmSizes = vmInfos.Where(v => !v.LowPriority).Select(v => v.VmSize);
 
@@ -138,12 +164,12 @@ namespace TesApi.Web
                     MemoryInGiB = v.VmInfoWithDedicatedPrice.MemoryInGB?.ToString(),
                     NumberOfCores = v.VmInfoWithDedicatedPrice.NumberOfCores.ToString(),
                     ResourceDiskSizeInGiB = v.VmInfoWithDedicatedPrice.ResourceDiskSizeInGB.ToString(),
-                    DedicatedQuota = batchAccountQuotas.DedicatedCoreQuotaPerVMFamilyEnforced 
-                        ? batchAccountQuotas.DedicatedCoreQuotaPerVMFamily.FirstOrDefault(q => q.Name.Equals(v.VmInfoWithDedicatedPrice.VmFamily, StringComparison.OrdinalIgnoreCase))?.CoreQuota.ToString() ?? "N/A"
-                        : batchAccountQuotas.DedicatedCoreQuota.ToString()
+                    DedicatedQuota = batchAccountQuotas.IsDedicatedAndPerVmFamilyCoreQuotaEnforced
+                        ? batchAccountQuotas.DedicatedCoreQuotas.FirstOrDefault(q => q.VmFamilyName.Equals(v.VmInfoWithDedicatedPrice.VmFamily, StringComparison.OrdinalIgnoreCase))?.CoreQuota.ToString() ?? "N/A"
+                        : batchAccountQuotas.NumberOfCores.ToString()
                 });
 
-            vmInfosAsStrings = vmInfosAsStrings.Prepend(new { VmSize = string.Empty, VmFamily = string.Empty, PricePerHourDedicated = "dedicated", PricePerHourLowPri = "low pri", MemoryInGiB = "(GiB)", NumberOfCores = string.Empty, ResourceDiskSizeInGiB = "(GiB)", DedicatedQuota = $"quota {(batchAccountQuotas.DedicatedCoreQuotaPerVMFamilyEnforced ? "(per fam.)" : "(total)")}" });
+            vmInfosAsStrings = vmInfosAsStrings.Prepend(new { VmSize = string.Empty, VmFamily = string.Empty, PricePerHourDedicated = "dedicated", PricePerHourLowPri = "low pri", MemoryInGiB = "(GiB)", NumberOfCores = string.Empty, ResourceDiskSizeInGiB = "(GiB)", DedicatedQuota = $"quota {(batchAccountQuotas.IsDedicatedAndPerVmFamilyCoreQuotaEnforced ? "(per fam.)" : "(total)")}" });
             vmInfosAsStrings = vmInfosAsStrings.Prepend(new { VmSize = "VM Size", VmFamily = "Family", PricePerHourDedicated = "$/hour", PricePerHourLowPri = "$/hour", MemoryInGiB = "Memory", NumberOfCores = "CPUs", ResourceDiskSizeInGiB = "Disk", DedicatedQuota = "Dedicated CPU" });
 
             var sizeColWidth = vmInfosAsStrings.Max(v => v.VmSize.Length);
@@ -156,7 +182,7 @@ namespace TesApi.Web
             var dedicatedQuotaColumnWidth = vmInfosAsStrings.Max(v => v.DedicatedQuota.Length);
 
             var fixedWidthVmInfos = vmInfosAsStrings.Select(v => $"{v.VmSize.PadRight(sizeColWidth)} {v.VmFamily.PadRight(seriesColWidth)} {v.PricePerHourDedicated.PadLeft(priceDedicatedColumnWidth)}  {v.PricePerHourLowPri.PadLeft(priceLowPriColumnWidth)}  {v.MemoryInGiB.PadLeft(memoryColumnWidth)}  {v.NumberOfCores.PadLeft(coresColumnWidth)}  {v.ResourceDiskSizeInGiB.PadLeft(diskColumnWidth)}  {v.DedicatedQuota.PadLeft(dedicatedQuotaColumnWidth)}");
-            
+
             return string.Join('\n', fixedWidthVmInfos);
         }
     }

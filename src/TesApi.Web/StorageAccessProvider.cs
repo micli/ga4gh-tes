@@ -22,6 +22,7 @@ namespace TesApi.Web
         private readonly ILogger logger;
         private readonly IAzureProxy azureProxy;
         private const string CromwellPathPrefix = "/cromwell-executions/";
+        private const string BatchPathPrefix = "/executions/";
         private readonly string defaultStorageAccountName;
         private static readonly TimeSpan sasTokenDuration = TimeSpan.FromDays(3);
         private readonly List<ExternalStorageContainerInfo> externalStorageContainers;
@@ -32,7 +33,7 @@ namespace TesApi.Web
         /// <param name="logger">Logger <see cref="ILogger"/></param>
         /// <param name="configuration">Configuration <see cref="IConfiguration"/></param>
         /// <param name="azureProxy">Azure proxy <see cref="IAzureProxy"/></param>
-        public StorageAccessProvider(ILogger logger, IConfiguration configuration, IAzureProxy azureProxy)
+        public StorageAccessProvider(ILogger<StorageAccessProvider> logger, IConfiguration configuration, IAzureProxy azureProxy)
         {
             this.logger = logger;
             this.azureProxy = azureProxy;
@@ -41,7 +42,8 @@ namespace TesApi.Web
             logger.LogInformation($"DefaultStorageAccountName: {defaultStorageAccountName}");
 
             externalStorageContainers = configuration["ExternalStorageContainers"]?.Split(new[] { ',', ';', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(uri => {
+                .Select(uri =>
+                {
                     if (StorageAccountUrlSegments.TryCreate(uri, out var s))
                     {
                         return new ExternalStorageContainerInfo { BlobEndpoint = s.BlobEndpoint, AccountName = s.AccountName, ContainerName = s.ContainerName, SasToken = s.SasToken };
@@ -130,7 +132,7 @@ namespace TesApi.Web
             // This would allow the user to omit the account name for files stored in the default storage account
 
             // /cromwell-executions/... URLs become /defaultStorageAccountName/cromwell-executions/... to unify how URLs starting with /acct/container/... pattern are handled.
-            if (path.StartsWith(CromwellPathPrefix, StringComparison.OrdinalIgnoreCase))
+            if (path.StartsWith(CromwellPathPrefix, StringComparison.OrdinalIgnoreCase) || path.StartsWith(BatchPathPrefix, StringComparison.OrdinalIgnoreCase))
             {
                 path = $"/{defaultStorageAccountName}{path}";
             }

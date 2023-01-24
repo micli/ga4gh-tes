@@ -4,6 +4,7 @@
 using System;
 using System.IO;
 using System.Reflection;
+using Azure.Identity;
 using LazyCache;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -11,12 +12,16 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
 using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Serialization;
 using Tes.Models;
 using Tes.Repository;
 using TesApi.Filters;
+using TesApi.Web.Management;
+using TesApi.Web.Management.Clients;
+using TesApi.Web.Management.Configuration;
 
 namespace TesApi.Web
 {
@@ -25,65 +30,44 @@ namespace TesApi.Web
     /// </summary>
     public class Startup
     {
-        private const string DefaultAzureOfferDurableId = "MS-AZR-0003p";
         private const string CosmosDbDatabaseId = "TES";
         private const string CosmosDbContainerId = "Tasks";
         private const string CosmosDbPartitionId = "01";
 
         private readonly ILogger logger;
-        private readonly ILoggerFactory loggerFactory;
         private readonly IWebHostEnvironment hostingEnvironment;
-        private readonly string azureOfferDurableId;
 
         /// <summary>
         /// Startup class for ASP.NET core
         /// </summary>
-        public Startup(IConfiguration configuration, ILoggerFactory loggerFactory, IWebHostEnvironment hostingEnvironment)
+        public Startup(IConfiguration configuration, ILogger<Startup> logger, IWebHostEnvironment hostingEnvironment)
         {
             Configuration = configuration;
             this.hostingEnvironment = hostingEnvironment;
-            logger = loggerFactory.CreateLogger<Startup>();
-            this.loggerFactory = loggerFactory;
-            azureOfferDurableId = Configuration.GetValue("AzureOfferDurableId", DefaultAzureOfferDurableId);
+            this.logger = logger;
         }
 
         /// <summary>
         /// The application configuration
         /// </summary>
-        public IConfiguration Configuration { get; }
+        private IConfiguration Configuration { get; }
 
         /// <summary>
         /// This method gets called by the runtime. Use this method to add services to the container.
         /// </summary>
         /// <param name="services">The Microsoft.Extensions.DependencyInjection.IServiceCollection to add the services to.</param>
         public void ConfigureServices(IServiceCollection services)
-        {
-            var (cache, azureProxy, cachingAzureProxy, storageAccessProvider, repository) = ConfigureServices();
-            ConfigureServices(services, cache, azureProxy, cachingAzureProxy, storageAccessProvider, repository);
-        }
+            => services
+                .Configure<BatchAccountOptions>(Configuration.GetSection(BatchAccountOptions.BatchAccount))
+                .Configure<CosmosDbOptions>(Configuration.GetSection(CosmosDbOptions.CosmosDbAccount))
+                .Configure<RetryPolicyOptions>(Configuration.GetSection(RetryPolicyOptions.RetryPolicy))
+                .Configure<TerraOptions>(Configuration.GetSection(TerraOptions.Terra))
+                .AddSingleton<IAppCache, CachingService>()
 
-        private (IAppCache cache, AzureProxy azureProxy, IAzureProxy cachingAzureProxy, IStorageAccessProvider storageAccessProvider, IRepository<TesTask> repository) ConfigureServices()
-        {
-            var cache = new CachingService();
+                .AddSingleton<AzureProxy, AzureProxy>()
+                .AddSingleton<IAzureProxy>(sp => ActivatorUtilities.CreateInstance<CachingWithRetriesAzureProxy>(sp, (IAzureProxy)sp.GetRequiredService(typeof(AzureProxy))))
 
-            var azureProxy = new AzureProxy(Configuration["BatchAccountName"], azureOfferDurableId, loggerFactory.CreateLogger<AzureProxy>());
-            IAzureProxy cachingAzureProxy = new CachingWithRetriesAzureProxy(azureProxy, cache);
-            IStorageAccessProvider storageAccessProvider = new StorageAccessProvider(loggerFactory.CreateLogger<StorageAccessProvider>(), Configuration, cachingAzureProxy);
-
-            var configurationUtils = new ConfigurationUtils(Configuration, cachingAzureProxy, storageAccessProvider, loggerFactory.CreateLogger<ConfigurationUtils>());
-            configurationUtils.ProcessAllowedVmSizesConfigurationFileAsync().Wait();
-
-            (var cosmosDbEndpoint, var cosmosDbKey) = azureProxy.GetCosmosDbEndpointAndKeyAsync(Configuration["CosmosDbAccountName"]).Result;
-            var cosmosDbRepository = new CosmosDbRepository<TesTask>(cosmosDbEndpoint, cosmosDbKey, CosmosDbDatabaseId, CosmosDbContainerId, CosmosDbPartitionId);
-
-            return (cache, azureProxy, cachingAzureProxy, storageAccessProvider, cosmosDbRepository);
-        }
-
-        private void ConfigureServices(IServiceCollection services, IAppCache cache, AzureProxy azureProxy, IAzureProxy cachingAzureProxy, IStorageAccessProvider storageAccessProvider, IRepository<TesTask> repository)
-            => services.AddSingleton(cache)
-
-                .AddSingleton(cachingAzureProxy)
-                .AddSingleton(azureProxy)
+                .AddSingleton(CreateCosmosDbRepositoryFromConfiguration)
 
                 .AddControllers()
                 .AddNewtonsoftJson(opts =>
@@ -92,14 +76,27 @@ namespace TesApi.Web
                     opts.SerializerSettings.Converters.Add(new StringEnumConverter(new CamelCaseNamingStrategy()));
                 }).Services
 
-                .AddSingleton<IRepository<TesTask>>(new CachingWithRetriesRepository<TesTask>(repository))
-                .AddSingleton<IBatchScheduler>(new BatchScheduler(loggerFactory.CreateLogger<BatchScheduler>(), Configuration, cachingAzureProxy, storageAccessProvider))
+                .AddSingleton<IBatchScheduler, BatchScheduler>()
+                .AddSingleton<IStorageAccessProvider, StorageAccessProvider>()
+
+                .AddLogging()
+                .AddSingleton<ContainerRegistryProvider, ContainerRegistryProvider>()
+                .AddSingleton<CacheAndRetryHandler, CacheAndRetryHandler>()
+                .AddSingleton<IBatchQuotaVerifier, BatchQuotaVerifier>()
+                .AddSingleton<IBatchScheduler, BatchScheduler>()
+                .AddSingleton<PriceApiClient, PriceApiClient>()
+                .AddSingleton<IBatchSkuInformationProvider>(sp => ActivatorUtilities.CreateInstance<PriceApiBatchSkuInformationProvider>(sp))
+                .AddSingleton(CreateBatchAccountResourceInformation)
+                .AddSingleton(CreateBatchQuotaProviderFromConfiguration)
+                .AddSingleton<AzureManagementClientsFactory, AzureManagementClientsFactory>()
+                .AddSingleton<ArmBatchQuotaProvider, ArmBatchQuotaProvider>() //added so config utils gets the arm implementation, to be removed once config utils is refactored.
+                .AddSingleton<ConfigurationUtils, ConfigurationUtils>()
 
                 .AddSwaggerGen(c =>
                 {
-                    c.SwaggerDoc("0.3.3", new OpenApiInfo
+                    c.SwaggerDoc("0.4.0", new OpenApiInfo
                     {
-                        Version = "0.3.3",
+                        Version = "0.4.0",
                         Title = "Task Execution Service",
                         Description = "Task Execution Service (ASP.NET Core 7.0)",
                         Contact = new OpenApiContact()
@@ -107,9 +104,16 @@ namespace TesApi.Web
                             Name = "Microsoft Biomedical Platforms and Genomics",
                             Url = new Uri("https://github.com/microsoft/CromwellOnAzure")
                         },
+                        License = new OpenApiLicense()
+                        {
+                            Name = "MIT License",
+                            // Identifier = "MIT" //TODO: when available, remove Url -- https://spec.openapis.org/oas/v3.1.0#fixed-fields-2
+                            Url = new("https://spdx.org/licenses/MIT", UriKind.Absolute)
+                        },
                     });
                     c.CustomSchemaIds(type => type.FullName);
-                    c.IncludeXmlComments($"{AppContext.BaseDirectory}{Path.DirectorySeparatorChar}{Assembly.GetEntryAssembly().GetName().Name}.xml");
+                    c.IncludeXmlComments(
+                        $"{AppContext.BaseDirectory}{Path.DirectorySeparatorChar}{Assembly.GetEntryAssembly().GetName().Name}.xml");
                     c.OperationFilter<GeneratePathParamsValidationFilter>();
                 })
 
@@ -117,9 +121,11 @@ namespace TesApi.Web
                 .AddHostedService<DeleteCompletedBatchJobsHostedService>()
                 .AddHostedService<DeleteOrphanedBatchJobsHostedService>()
                 .AddHostedService<DeleteOrphanedAutoPoolsHostedService>()
-                .AddHostedService<RefreshVMSizesAndPricesHostedService>()
+                //.AddHostedService<RefreshVMSizesAndPricesHostedService>()
+                .AddHostedService<DoOnceAtStartUpService>()
 
-            // Configure AppInsights Azure Service when in PRODUCTION environment
+
+                //Configure AppInsights Azure Service when in PRODUCTION environment
                 .IfThenElse(hostingEnvironment.IsProduction(),
                     s =>
                     {
@@ -130,21 +136,92 @@ namespace TesApi.Web
                         {
                             var connectionString = $"InstrumentationKey={instrumentationKey}";
                             return s.AddApplicationInsightsTelemetry(options =>
-                                {
-                                    options.ConnectionString = connectionString;
-                                });
+                            {
+                                options.ConnectionString = connectionString;
+                            });
                         }
 
                         return s;
                     },
-                    s => s.AddApplicationInsightsTelemetry());
+                s => s.AddApplicationInsightsTelemetry());
+
+        private IBatchQuotaProvider CreateBatchQuotaProviderFromConfiguration(IServiceProvider services)
+        {
+            var terraOptions = services.GetService<IOptions<TerraOptions>>();
+
+            if (!string.IsNullOrEmpty(terraOptions?.Value.LandingZoneApiHost))
+            {
+                var cacheAndRetryHandler = services.GetRequiredService<CacheAndRetryHandler>();
+                var serviceLogger = services.GetService<ILogger<TerraLandingZoneApiClient>>();
+                var credentials = new DefaultAzureCredential();
+
+                var terraApiClient = new TerraLandingZoneApiClient(terraOptions.Value.LandingZoneApiHost,
+                    credentials,
+                    cacheAndRetryHandler,
+                    serviceLogger);
+                return new TerraQuotaProvider(terraApiClient, terraOptions);
+            }
+
+            return ActivatorUtilities.CreateInstance<ArmBatchQuotaProvider>(services);
+        }
+
+        private IRepository<TesTask> CreateCosmosDbRepositoryFromConfiguration(IServiceProvider services)
+        {
+            var options = services.GetRequiredService<IOptions<CosmosDbOptions>>();
+
+            if (!string.IsNullOrWhiteSpace(options.Value.CosmosDbKey))
+            {
+                return WrapService(ActivatorUtilities.CreateInstance<CosmosDbRepository<TesTask>>(services,
+                    options.Value.CosmosDbEndpoint, options.Value.CosmosDbKey, CosmosDbDatabaseId, CosmosDbContainerId, CosmosDbPartitionId));
+            }
+
+            var azureProxy = services.GetRequiredService<IAzureProxy>();
+
+            (var cosmosDbEndpoint, var cosmosDbKey) = azureProxy.GetCosmosDbEndpointAndKeyAsync(options.Value.AccountName).Result;
+
+            return WrapService(ActivatorUtilities.CreateInstance<CosmosDbRepository<TesTask>>(services,
+                cosmosDbEndpoint, cosmosDbKey, CosmosDbDatabaseId, CosmosDbContainerId, CosmosDbPartitionId));
+
+            IRepository<TesTask> WrapService(IRepository<TesTask> service)
+                => ActivatorUtilities.CreateInstance<CachingWithRetriesRepository<TesTask>>(services, service);
+        }
+
+        private BatchAccountResourceInformation CreateBatchAccountResourceInformation(IServiceProvider services)
+        {
+            var options = services.GetRequiredService<IOptions<BatchAccountOptions>>();
+
+            if (string.IsNullOrEmpty(options.Value.AccountName))
+            {
+                throw new InvalidOperationException(
+                    "The batch account name is missing. Please check your configuration.");
+            }
+
+
+            if (string.IsNullOrWhiteSpace(options.Value.AppKey))
+            {
+                //we are assuming Arm with MI/RBAC if no key is provided. Try to get info from the batch account.
+                var task = AzureManagementClientsFactory.TryGetResourceInformationFromAccountNameAsync(options.Value.AccountName);
+                task.Wait();
+
+                if (task.Result == null)
+                {
+                    throw new InvalidOperationException(
+                        $"Failed to get the resource information for the Batch account using ARM. Please check the options provided. Provided Batch account name:{options.Value.AccountName}");
+                }
+
+                return task.Result;
+            }
+
+            //assume the information was provided via configuration
+            return new BatchAccountResourceInformation(options.Value.AccountName, options.Value.ResourceGroup, options.Value.SubscriptionId, options.Value.Region);
+        }
 
         /// <summary>
         /// This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
         /// </summary>
         /// <param name="app">An Microsoft.AspNetCore.Builder.IApplicationBuilder for the app to configure.</param>
         public void Configure(IApplicationBuilder app)
-            => app.UseRouting()
+        => app.UseRouting()
                 .UseEndpoints(endpoints =>
                 {
                     endpoints.MapControllers();
@@ -160,7 +237,7 @@ namespace TesApi.Web
                 })
                 .UseSwaggerUI(c =>
                 {
-                    c.SwaggerEndpoint("/swagger/0.3.0/openapi.json", "Task Execution Service");
+                    c.SwaggerEndpoint("/swagger/0.3.3/openapi.json", "Task Execution Service");
                 })
 
                 .IfThenElse(hostingEnvironment.IsDevelopment(),
@@ -175,7 +252,14 @@ namespace TesApi.Web
                         var r = s.UseHsts();
                         logger.LogInformation("Configuring for Production environment");
                         return r;
-                    });
+                    })
+
+                .IfThenElse(false, s => s, s =>
+                {
+                    var configurationUtils = ActivatorUtilities.GetServiceOrCreateInstance<ConfigurationUtils>(s.ApplicationServices);
+                    configurationUtils.ProcessAllowedVmSizesConfigurationFileAsync().Wait();
+                    return s;
+                });
     }
 
     internal static class BooleanMethodSelectorExtensions

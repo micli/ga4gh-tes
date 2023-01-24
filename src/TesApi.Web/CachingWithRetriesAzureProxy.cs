@@ -9,7 +9,7 @@ using LazyCache;
 using Microsoft.Azure.Batch;
 using Polly;
 using Polly.Retry;
-using Tes.Models;
+using BatchModels = Microsoft.Azure.Management.Batch.Models;
 
 namespace TesApi.Web
 {
@@ -21,13 +21,17 @@ namespace TesApi.Web
         private readonly IAzureProxy azureProxy;
         private readonly IAppCache cache;
 
+        private static readonly int RetryCount = 3;
+        private static TimeSpan SleepDurationProvider(int attempt)
+            => TimeSpan.FromSeconds(Math.Pow(2, attempt));
+
         private readonly AsyncRetryPolicy asyncRetryPolicy = Policy
             .Handle<Exception>()
-            .WaitAndRetryAsync(3, attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)));
+            .WaitAndRetryAsync(RetryCount, SleepDurationProvider);
 
         private readonly RetryPolicy retryPolicy = Policy
             .Handle<Exception>()
-            .WaitAndRetry(3, attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)));
+            .WaitAndRetry(RetryCount, SleepDurationProvider);
 
         /// <summary>
         /// Contructor to create a cache of <see cref="IAzureProxy"/>
@@ -47,7 +51,7 @@ namespace TesApi.Web
         public Task DeleteBatchJobAsync(string taskId, CancellationToken cancellationToken = default) => asyncRetryPolicy.ExecuteAsync(ct => azureProxy.DeleteBatchJobAsync(taskId, ct), cancellationToken);
 
         /// <inheritdoc/>
-        public Task DeleteBatchPoolAsync(string poolId, CancellationToken cancellationToken = default) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.DeleteBatchPoolAsync(poolId, cancellationToken));
+        public Task DeleteBatchPoolAsync(string poolId, CancellationToken cancellationToken = default) => asyncRetryPolicy.ExecuteAsync(ct => azureProxy.DeleteBatchPoolAsync(poolId, ct), cancellationToken);
 
         /// <inheritdoc/>
         public Task<string> DownloadBlobAsync(Uri blobAbsoluteUri) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.DownloadBlobAsync(blobAbsoluteUri));
@@ -56,12 +60,7 @@ namespace TesApi.Web
         public Task<bool> BlobExistsAsync(Uri blobAbsoluteUri) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.BlobExistsAsync(blobAbsoluteUri));
 
         /// <inheritdoc/>
-        public Task<IEnumerable<string>> GetActivePoolIdsAsync(string prefix, TimeSpan minAge, CancellationToken cancellationToken) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.GetActivePoolIdsAsync(prefix, minAge, cancellationToken));
-
-        /// <inheritdoc/>
-        public Task<AzureBatchAccountQuotas> GetBatchAccountQuotasAsync()
-            => cache.GetOrAddAsync("batchAccountQuotas", () =>
-                asyncRetryPolicy.ExecuteAsync(() => azureProxy.GetBatchAccountQuotasAsync()), DateTimeOffset.Now.AddHours(1));
+        public Task<IEnumerable<string>> GetActivePoolIdsAsync(string prefix, TimeSpan minAge, CancellationToken cancellationToken) => asyncRetryPolicy.ExecuteAsync(ct => azureProxy.GetActivePoolIdsAsync(prefix, minAge, ct), cancellationToken);
 
         /// <inheritdoc/>
         public int GetBatchActiveJobCount() => retryPolicy.Execute(() => azureProxy.GetBatchActiveJobCount());
@@ -74,24 +73,6 @@ namespace TesApi.Web
 
         /// <inheritdoc/>
         public Task<AzureBatchJobAndTaskState> GetBatchJobAndTaskStateAsync(string tesTaskId) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.GetBatchJobAndTaskStateAsync(tesTaskId));
-
-        /// <inheritdoc/>
-        public async Task<ContainerRegistryInfo> GetContainerRegistryInfoAsync(string imageName)
-        {
-            var containerRegistryInfo = cache.Get<ContainerRegistryInfo>(imageName);
-
-            if (containerRegistryInfo is null)
-            {
-                containerRegistryInfo = await asyncRetryPolicy.ExecuteAsync(() => azureProxy.GetContainerRegistryInfoAsync(imageName));
-
-                if (containerRegistryInfo is not null)
-                {
-                    cache.Add(imageName, containerRegistryInfo, DateTimeOffset.Now.AddHours(1));
-                }
-            }
-
-            return containerRegistryInfo;
-        }
 
         /// <inheritdoc/>
         public Task<string> GetNextBatchJobIdAsync(string tesTaskId) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.GetNextBatchJobIdAsync(tesTaskId));
@@ -123,10 +104,6 @@ namespace TesApi.Web
         }
 
         /// <inheritdoc/>
-        public Task<List<VirtualMachineInformation>> GetVmSizesAndPricesAsync()
-            => cache.GetOrAddAsync("vmSizesAndPrices", () => azureProxy.GetVmSizesAndPricesAsync(), DateTimeOffset.MaxValue);
-
-        /// <inheritdoc/>
         public Task<IEnumerable<string>> ListBlobsAsync(Uri directoryUri) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.ListBlobsAsync(directoryUri));
 
         /// <inheritdoc/>
@@ -139,7 +116,7 @@ namespace TesApi.Web
         public Task UploadBlobAsync(Uri blobAbsoluteUri, string content) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.UploadBlobAsync(blobAbsoluteUri, content));
 
         /// <inheritdoc/>
-        public Task<(string, string)> GetCosmosDbEndpointAndKeyAsync(string cosmosDbAccountName) =>  azureProxy.GetCosmosDbEndpointAndKeyAsync(cosmosDbAccountName);
+        public Task<(string, string)> GetCosmosDbEndpointAndKeyAsync(string cosmosDbAccountName) => azureProxy.GetCosmosDbEndpointAndKeyAsync(cosmosDbAccountName);
 
         /// <inheritdoc/>
         public Task UploadBlobFromFileAsync(Uri blobAbsoluteUri, string filePath) => asyncRetryPolicy.ExecuteAsync(() => azureProxy.UploadBlobFromFileAsync(blobAbsoluteUri, filePath));
@@ -151,8 +128,10 @@ namespace TesApi.Web
         public bool TryReadCwlFile(string workflowId, out string content) => azureProxy.TryReadCwlFile(workflowId, out content);
 
         /// <inheritdoc/>
-        public Task<ManualBatchPoolCreationResult> CreateManualBatchPoolAsync(string poolName, string vmSize, bool isLowPriority, string executorImage, BatchNodeInfo nodeInfo, string dockerInDockerImageName, string blobxferImageName, IEnumerable<string> identityResourceIds, bool disableBatchNodesPublicIpAddress, string batchNodesSubnetId, string startTaskSasUrl, string startTaskPath)
-            => azureProxy.CreateManualBatchPoolAsync(poolName, vmSize, isLowPriority, executorImage, nodeInfo, dockerInDockerImageName, blobxferImageName, identityResourceIds, disableBatchNodesPublicIpAddress, batchNodesSubnetId, startTaskSasUrl, startTaskPath);
+        public string GetArmRegion() => azureProxy.GetArmRegion();
+
+        /// <inheritdoc/>
+        public Task<PoolInformation> CreateBatchPoolAsync(BatchModels.Pool poolInfo, bool isPreemptable) => azureProxy.CreateBatchPoolAsync(poolInfo, isPreemptable);
 
         /// <inheritdoc/>
         public Task DeleteBatchPoolIfExistsAsync(string poolId, CancellationToken cancellationToken = default)

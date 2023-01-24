@@ -5,9 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text;
+//using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,22 +14,27 @@ using Microsoft.Azure.Batch.Auth;
 using Microsoft.Azure.Batch.Common;
 using Microsoft.Azure.Management.ApplicationInsights.Management;
 using Microsoft.Azure.Management.Batch;
-using Microsoft.Azure.Management.Batch.Models;
-using Microsoft.Azure.Management.Compute.Fluent;
 using Microsoft.Azure.Management.ContainerRegistry.Fluent;
 using Microsoft.Azure.Management.ResourceManager.Fluent;
 using Microsoft.Azure.Management.ResourceManager.Fluent.Authentication;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Core;
 using Microsoft.Azure.Services.AppAuthentication;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Microsoft.Rest;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
-using Tes.Models;
-using FluentAzure = Microsoft.Azure.Management.Fluent.Azure;
 using Polly;
 using Polly.Retry;
+using TesApi.Web.Management.Configuration;
+using BatchModels = Microsoft.Azure.Management.Batch.Models;
+using CloudTask = Microsoft.Azure.Batch.CloudTask;
+using ComputeNodeState = Microsoft.Azure.Batch.Common.ComputeNodeState;
+using FluentAzure = Microsoft.Azure.Management.Fluent.Azure;
+using JobState = Microsoft.Azure.Batch.Common.JobState;
+using OnAllTasksComplete = Microsoft.Azure.Batch.Common.OnAllTasksComplete;
+using PoolInformation = Microsoft.Azure.Batch.PoolInformation;
+using TaskExecutionInformation = Microsoft.Azure.Batch.TaskExecutionInformation;
+using TaskState = Microsoft.Azure.Batch.Common.TaskState;
 
 namespace TesApi.Web
 {
@@ -41,52 +44,70 @@ namespace TesApi.Web
     public class AzureProxy : IAzureProxy
     {
         private const char BatchJobAttemptSeparator = '-';
-        private const string DefaultAzureBillingRegionName = "US West";
+        //private const string DefaultAzureBillingRegionName = "US West";
 
-        private static readonly HttpClient httpClient = new();
+        //private static readonly HttpClient httpClient = new();
         private static readonly AsyncRetryPolicy batchRaceConditionJobNotFoundRetryPolicy = Policy
             .Handle<BatchException>(ex => ex.RequestInformation.BatchError.Code == BatchErrorCodeStrings.JobNotFound)
             .WaitAndRetryAsync(10, retryAttempt => TimeSpan.FromSeconds(1));
 
         private readonly ILogger logger;
-        private readonly Func<Task<BatchAccount>> getBatchAccountFunc;
         private readonly BatchClient batchClient;
         private readonly string subscriptionId;
         private readonly string location;
-        private readonly string billingRegionName;
-        private readonly string azureOfferDurableId;
+        //private readonly string billingRegionName;
+        //private readonly string azureOfferDurableId;
         private readonly string batchResourceGroupName;
         private readonly string batchAccountName;
 
 
         /// <summary>
-        /// The constructor
+        /// Constructor of AzureProxy
         /// </summary>
-        /// <param name="batchAccountName">Batch account name</param>
-        /// <param name="azureOfferDurableId">Azure offer id</param>
+        /// <param name="batchAccountOptions">The Azure Batch Account options</param>
         /// <param name="logger">The logger</param>
-        public AzureProxy(string batchAccountName, string azureOfferDurableId, ILogger logger)
+        /// <exception cref="InvalidOperationException"></exception>
+        public AzureProxy(IOptions<BatchAccountOptions> batchAccountOptions, ILogger<AzureProxy> logger)
         {
-            this.logger = logger;
-            this.batchAccountName = batchAccountName;
-            var (SubscriptionId, ResourceGroupName, Location, BatchAccountEndpoint) = FindBatchAccountAsync(batchAccountName).Result;
-            batchResourceGroupName = ResourceGroupName;
-            subscriptionId = SubscriptionId;
-            location = Location;
-            batchClient = BatchClient.Open(new BatchTokenCredentials($"https://{BatchAccountEndpoint}", () => GetAzureAccessTokenAsync("https://batch.core.windows.net/")));
 
-            getBatchAccountFunc = async () => 
-                await new BatchManagementClient(new TokenCredentials(await GetAzureAccessTokenAsync())) { SubscriptionId = SubscriptionId }
-                    .BatchAccount
-                    .GetAsync(ResourceGroupName, batchAccountName);
+            ArgumentNullException.ThrowIfNull(batchAccountOptions);
+            ArgumentNullException.ThrowIfNull(logger);
 
-            this.azureOfferDurableId = azureOfferDurableId;
-
-            if (! AzureRegionUtils.TryGetBillingRegionName(location, out billingRegionName))
+            if (string.IsNullOrWhiteSpace(batchAccountOptions.Value.AccountName))
             {
-                logger.LogWarning($"Azure ARM location '{location}' does not have a corresponding Azure Billing Region.  Prices from the fallback billing region '{DefaultAzureBillingRegionName}' will be used instead.");
-                billingRegionName = DefaultAzureBillingRegionName;
+                //TODO: check if there's a better exception for this scenario or we need to create a custom one.
+                throw new InvalidOperationException("The batch account name is missing from the the configuration.");
             }
+
+            this.logger = logger;
+
+            if (!string.IsNullOrWhiteSpace(batchAccountOptions.Value.AppKey))
+            {
+                //If the key is provided assume we won't use ARM and the information will be provided via config
+                batchClient = BatchClient.Open(new BatchSharedKeyCredentials(batchAccountOptions.Value.BaseUrl,
+                    batchAccountOptions.Value.AccountName, batchAccountOptions.Value.AppKey));
+                location = batchAccountOptions.Value.Region;
+                subscriptionId = batchAccountOptions.Value.SubscriptionId;
+                batchResourceGroupName = batchAccountOptions.Value.ResourceGroup;
+
+            }
+            else
+            {
+                this.batchAccountName = batchAccountOptions.Value.AccountName;
+                var (SubscriptionId, ResourceGroupName, Location, BatchAccountEndpoint) = FindBatchAccountAsync(batchAccountName).Result;
+                batchResourceGroupName = ResourceGroupName;
+                subscriptionId = SubscriptionId;
+                location = Location;
+                batchClient = BatchClient.Open(new BatchTokenCredentials($"https://{BatchAccountEndpoint}", () => GetAzureAccessTokenAsync("https://batch.core.windows.net/")));
+            }
+
+            //azureOfferDurableId = batchAccountOptions.Value.AzureOfferDurableId;
+
+            //if (!AzureRegionUtils.TryGetBillingRegionName(location, out billingRegionName))
+            //{
+            //    logger.LogWarning($"Azure ARM location '{location}' does not have a corresponding Azure Billing Region.  Prices from the fallback billing region '{DefaultAzureBillingRegionName}' will be used instead.");
+            //    billingRegionName = DefaultAzureBillingRegionName;
+            //}
         }
 
         // TODO: Static method because the instrumentation key is needed in both Program.cs and Startup.cs and we wanted to avoid intializing the batch client twice.
@@ -123,11 +144,7 @@ namespace TesApi.Web
             return null;
         }
 
-        /// <summary>
-        /// Gets CosmosDB endpoint and key
-        /// </summary>
-        /// <param name="cosmosDbAccountName"></param>
-        /// <returns>The CosmosDB endpoint and key of the specified account</returns>
+        /// <inheritdoc/>
         public async Task<(string, string)> GetCosmosDbEndpointAndKeyAsync(string cosmosDbAccountName)
         {
             var azureClient = await GetAzureManagementClientAsync();
@@ -147,11 +164,7 @@ namespace TesApi.Web
             return (account.DocumentEndpoint, key);
         }
 
-        /// <summary>
-        /// Gets a new Azure Batch job id to schedule another task
-        /// </summary>
-        /// <param name="tesTaskId">The unique TES task ID</param>
-        /// <returns>The next logical, new Azure Batch job ID</returns>
+        /// <inheritdoc/>
         public async Task<string> GetNextBatchJobIdAsync(string tesTaskId)
         {
             var jobFilter = new ODATADetailLevel
@@ -169,10 +182,7 @@ namespace TesApi.Web
         }
 
 
-        /// <summary>
-        /// Gets the counts of active batch nodes, grouped by VmSize
-        /// </summary>
-        /// <returns>Batch node counts</returns>
+        /// <inheritdoc/>
         public IEnumerable<AzureBatchNodeCount> GetBatchActiveNodeCountByVmSize()
             => batchClient.PoolOperations.ListPools()
                 .Select(p => new
@@ -184,10 +194,7 @@ namespace TesApi.Web
                 .GroupBy(x => x.VirtualMachineSize)
                 .Select(grp => new AzureBatchNodeCount { VirtualMachineSize = grp.Key, DedicatedNodeCount = grp.Sum(x => x.DedicatedNodeCount), LowPriorityNodeCount = grp.Sum(x => x.LowPriorityNodeCount) });
 
-        /// <summary>
-        /// Gets the count of active batch pools
-        /// </summary>
-        /// <returns>Count of active batch pools</returns>
+        /// <inheritdoc/>
         public int GetBatchActivePoolCount()
         {
             var activePoolsFilter = new ODATADetailLevel
@@ -199,10 +206,7 @@ namespace TesApi.Web
             return batchClient.PoolOperations.ListPools(activePoolsFilter).Count();
         }
 
-        /// <summary>
-        /// Gets the count of active batch jobs
-        /// </summary>
-        /// <returns>Count of active batch jobs</returns>
+        /// <inheritdoc/>
         public int GetBatchActiveJobCount()
         {
             var activeJobsFilter = new ODATADetailLevel
@@ -214,41 +218,7 @@ namespace TesApi.Web
             return batchClient.JobOperations.ListJobs(activeJobsFilter).Count();
         }
 
-        /// <summary>
-        /// Gets the batch quotas
-        /// </summary>
-        /// <returns>Batch quotas</returns>
-        public async Task<AzureBatchAccountQuotas> GetBatchAccountQuotasAsync()
-        {
-            try
-            {
-                var batchAccount = await getBatchAccountFunc();
-
-                return new AzureBatchAccountQuotas
-                {
-                    ActiveJobAndJobScheduleQuota = batchAccount.ActiveJobAndJobScheduleQuota,
-                    DedicatedCoreQuota = batchAccount.DedicatedCoreQuota.Value,
-                    DedicatedCoreQuotaPerVMFamily = batchAccount.DedicatedCoreQuotaPerVMFamily,
-                    DedicatedCoreQuotaPerVMFamilyEnforced = batchAccount.DedicatedCoreQuotaPerVMFamilyEnforced,
-                    LowPriorityCoreQuota = batchAccount.LowPriorityCoreQuota.Value,
-                    PoolQuota = batchAccount.PoolQuota,
-
-                };
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, $"An exception occurred when getting the batch account.");
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// Creates a new Azure Batch job
-        /// </summary>
-        /// <param name="jobId"></param>
-        /// <param name="cloudTask"></param>
-        /// <param name="poolInformation"></param>
-        /// <returns></returns>
+        /// <inheritdoc/>
         public async Task CreateBatchJobAsync(string jobId, CloudTask cloudTask, PoolInformation poolInformation)
         {
             logger.LogInformation($"TES task: {cloudTask.Id} - creating Batch job");
@@ -260,7 +230,7 @@ namespace TesApi.Web
             try
             {
                 logger.LogInformation($"TES task: {cloudTask.Id} adding task to job.");
-                job = await batchRaceConditionJobNotFoundRetryPolicy.ExecuteAsync(() => 
+                job = await batchRaceConditionJobNotFoundRetryPolicy.ExecuteAsync(() =>
                     batchClient.JobOperations.GetJobAsync(job.Id));
 
                 await job.AddTaskAsync(cloudTask);
@@ -283,12 +253,7 @@ namespace TesApi.Web
             }
         }
 
-
-        /// <summary>
-        /// Gets the combined state of Azure Batch job, task and pool that corresponds to the given TES task
-        /// </summary>
-        /// <param name="tesTaskId">The unique TES task ID</param>
-        /// <returns>Job state information</returns>
+        /// <inheritdoc/>
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1826:Do not use Enumerable methods on indexable collections", Justification = "FirstOrDefault() is straightforward, the alternative is less clear.")]
         public async Task<AzureBatchJobAndTaskState> GetBatchJobAndTaskStateAsync(string tesTaskId)
         {
@@ -325,22 +290,23 @@ namespace TesApi.Web
 
                 var job = lastJobInfo.Job;
                 var attemptNumber = lastJobInfo.AttemptNumber;
+                var poolId = job.ExecutionInformation?.PoolId;
 
-                if (job.State == JobState.Active && job.ExecutionInformation?.PoolId is not null)
+                if (job.State == JobState.Active && poolId is not null)
                 {
                     var poolFilter = new ODATADetailLevel
                     {
-                        FilterClause = $"id eq '{job.ExecutionInformation.PoolId}'",
+                        FilterClause = $"id eq '{poolId}'",
                         SelectClause = "*"
                     };
 
-                    var pool = (await batchClient.PoolOperations.ListPools(poolFilter).ToListAsync()).FirstOrDefault();
+                    var pool = await batchClient.PoolOperations.ListPools(poolFilter).ToAsyncEnumerable().FirstOrDefaultAsync();
 
                     if (pool is not null)
                     {
                         nodeAllocationFailed = pool.ResizeErrors?.Count > 0;
 
-                        var node = (await pool.ListComputeNodes().ToListAsync()).FirstOrDefault();
+                        var node = await pool.ListComputeNodes().ToAsyncEnumerable().FirstOrDefaultAsync(n => (n.RecentTasks?.Select(t => t.JobId) ?? Enumerable.Empty<string>()).Contains(job.Id));
 
                         if (node is not null)
                         {
@@ -400,11 +366,7 @@ namespace TesApi.Web
             }
         }
 
-        /// <summary>
-        /// Deletes an Azure Batch job
-        /// </summary>
-        /// <param name="tesTaskId">The unique TES task ID</param>
-        /// <param name="cancellationToken"></param>
+        /// <inheritdoc/>
         public async Task DeleteBatchJobAsync(string tesTaskId, CancellationToken cancellationToken = default)
         {
             var jobFilter = new ODATADetailLevel
@@ -427,10 +389,7 @@ namespace TesApi.Web
             }
         }
 
-        /// <summary>
-        /// Gets the ids of completed Batch jobs older than specified timespan
-        /// </summary>
-        /// <returns>List of Batch job ids</returns>
+        /// <inheritdoc/>
         public async Task<IEnumerable<string>> ListOldJobsToDeleteAsync(TimeSpan oldestJobAge)
         {
             var filter = new ODATADetailLevel
@@ -442,11 +401,7 @@ namespace TesApi.Web
             return (await batchClient.JobOperations.ListJobs(filter).ToListAsync()).Select(c => c.Id);
         }
 
-        /// <summary>
-        /// Gets the ids of orphaned Batch jobs older than the specified timespan
-        /// These jobs are active for prolonged period of time, have auto pool, NoAction termination option, and no tasks
-        /// </summary>
-        /// <returns>List of Batch job ids</returns>
+        /// <inheritdoc/>
         public async Task<IEnumerable<string>> ListOrphanedJobsToDeleteAsync(TimeSpan minJobAge, CancellationToken cancellationToken = default)
         {
             var filter = new ODATADetailLevel
@@ -463,10 +418,7 @@ namespace TesApi.Web
             return noActionTesjobsWithNoTasks.Select(j => j.Id);
         }
 
-        /// <summary>
-        /// Gets the list of active pool ids matching the prefix and with creation time older than the minAge
-        /// </summary>
-        /// <returns>Active pool ids</returns>
+        /// <inheritdoc/>
         public async Task<IEnumerable<string>> GetActivePoolIdsAsync(string prefix, TimeSpan minAge, CancellationToken cancellationToken = default)
         {
             var activePoolsFilter = new ODATADetailLevel
@@ -478,18 +430,13 @@ namespace TesApi.Web
             return (await batchClient.PoolOperations.ListPools(activePoolsFilter).ToListAsync(cancellationToken)).Select(p => p.Id);
         }
 
-        /// <summary>
-        /// Gets the list of pool ids referenced by the jobs
-        /// </summary>
-        /// <returns>Pool ids</returns>
+        /// <inheritdoc/>
         public async Task<IEnumerable<string>> GetPoolIdsReferencedByJobsAsync(CancellationToken cancellationToken = default)
             => (await batchClient.JobOperations.ListJobs(new ODATADetailLevel(selectClause: "executionInfo")).ToListAsync(cancellationToken))
                 .Where(j => !string.IsNullOrEmpty(j.ExecutionInformation?.PoolId))
                 .Select(j => j.ExecutionInformation.PoolId);
 
-        /// <summary>
-        /// Deletes the specified pool
-        /// </summary>
+        /// <inheritdoc/>
         public Task DeleteBatchPoolAsync(string poolId, CancellationToken cancellationToken = default)
             => batchClient.PoolOperations.DeletePoolAsync(poolId, cancellationToken: cancellationToken);
 
@@ -531,55 +478,7 @@ namespace TesApi.Web
             }
         }
 
-        /// <summary>
-        /// Gets the list of container registries that the TES server has access to
-        /// </summary>
-        /// <returns>List of container registries</returns>
-        private async Task<IEnumerable<ContainerRegistryInfo>> GetAccessibleContainerRegistriesAsync()
-        {
-            var azureClient = await GetAzureManagementClientAsync();
-            var subscriptionIds = (await azureClient.Subscriptions.ListAsync()).Select(s => s.SubscriptionId);
-            var infos = new List<ContainerRegistryInfo>();
-            logger.LogInformation(@"GetAccessibleContainerRegistriesAsync() called.");
-
-            foreach (var subId in subscriptionIds)
-            {
-                try
-                {
-                    var registries = (await azureClient.WithSubscription(subId).ContainerRegistries.ListAsync()).ToList();
-                    logger.LogInformation(@$"Searching {subId} for container registries.");
-
-                    foreach (var r in registries)
-                    {
-                        logger.LogInformation(@$"Found {r.Name}. AdminUserEnabled: {r.AdminUserEnabled}");
-
-                        try
-                        {
-                            var server = await r.GetCredentialsAsync();
-                            var info = new ContainerRegistryInfo { RegistryServer = r.LoginServerUrl, Username = server.Username, Password = server.AccessKeys[AccessKeyType.Primary] };
-                            infos.Add(info);
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.LogWarning($"TES service doesn't have permission to get credentials for registry {r.LoginServerUrl}.  Please verify that 'Admin user' is enabled in the 'Access Keys' area in the Azure Portal for this container registry.  Exception: {ex}");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    logger.LogWarning($"TES service doesn't have permission to list container registries in subscription {subId}.  Exception: {ex}");
-                }
-            }
-
-            logger.LogInformation(@"GetAccessibleContainerRegistriesAsync() returning {Count} registries.", infos.Count);
-            return infos;
-        }
-
-        /// <summary>
-        /// Gets the list of storage accounts that the TES server has access to
-        /// </summary>
-        /// <returns>List of storage accounts</returns>
-        public async Task<IEnumerable<StorageAccountInfo>> GetAccessibleStorageAccountsAsync()
+        private static async Task<IEnumerable<StorageAccountInfo>> GetAccessibleStorageAccountsAsync()
         {
             var azureClient = await GetAzureManagementClientAsync();
 
@@ -593,11 +492,7 @@ namespace TesApi.Web
                 .ToList();
         }
 
-        /// <summary>
-        /// Gets the primary key of the given storage account
-        /// </summary>
-        /// <param name="storageAccountInfo">Storage account info</param>
-        /// <returns>The primary key</returns>
+        /// <inheritdoc/>
         public async Task<string> GetStorageAccountKeyAsync(StorageAccountInfo storageAccountInfo)
         {
             try
@@ -614,29 +509,15 @@ namespace TesApi.Web
             }
         }
 
-        /// <summary>
-        /// Uploads the text content to a blob
-        /// </summary>
-        /// <param name="blobAbsoluteUri">Absolute Blob URI</param>
-        /// <param name="content">Blob content</param>
-        /// <returns>A task to await</returns>
+        /// <inheritdoc/>
         public Task UploadBlobAsync(Uri blobAbsoluteUri, string content)
             => new CloudBlockBlob(blobAbsoluteUri).UploadTextAsync(content);
 
-        /// <summary>
-        /// Uploads the file content to a blob
-        /// </summary>
-        /// <param name="blobAbsoluteUri">Absolute Blob URI</param>
-        /// <param name="filePath">File path</param>
-        /// <returns>A task to await</returns>
+        /// <inheritdoc/>
         public Task UploadBlobFromFileAsync(Uri blobAbsoluteUri, string filePath)
             => new CloudBlockBlob(blobAbsoluteUri).UploadFromFileAsync(filePath);
 
-        /// <summary>
-        /// Downloads a blob
-        /// </summary>
-        /// <param name="blobAbsoluteUri">Absolute Blob URI</param>
-        /// <returns>Blob content</returns>
+        /// <inheritdoc/>
         public Task<string> DownloadBlobAsync(Uri blobAbsoluteUri)
             => new CloudBlockBlob(blobAbsoluteUri).DownloadTextAsync();
 
@@ -644,11 +525,7 @@ namespace TesApi.Web
         public Task<bool> BlobExistsAsync(Uri blobAbsoluteUri)
             => new CloudBlockBlob(blobAbsoluteUri).ExistsAsync();
 
-        /// <summary>
-        /// Gets the list of blobs in the given directory
-        /// </summary>
-        /// <param name="directoryUri">Directory Uri</param>
-        /// <returns>List of blob paths</returns>
+        /// <inheritdoc/>
         public async Task<IEnumerable<string>> ListBlobsAsync(Uri directoryUri)
         {
             var blob = new CloudBlockBlob(directoryUri);
@@ -668,25 +545,11 @@ namespace TesApi.Web
             return results;
         }
 
-        /// <summary>
-        /// Get/sets cached value for the price and resource summary of all available VMs in a region for the <see cref="BatchAccount"/>.
-        /// </summary>
-        /// <returns><see cref="VirtualMachineInformation"/> for available VMs in a region.</returns>
-        public async Task<List<VirtualMachineInformation>> GetVmSizesAndPricesAsync()
-            => (await GetVmSizesAndPricesRawAsync()).ToList();
-
-        /// <summary>
-        /// Checks if a local file exists
-        /// </summary>
+        /// <inheritdoc/>
         public bool LocalFileExists(string path)
             => File.Exists(path);
 
-        /// <summary>
-        /// Reads the content of the Common Workflow Language (CWL) file associated with the parent workflow of the TES task
-        /// </summary>
-        /// <param name="workflowId">Parent workflow</param>
-        /// <param name="content">Content of the file</param>
-        /// <returns>True if file was found</returns>
+        /// <inheritdoc/>
         public bool TryReadCwlFile(string workflowId, out string content)
         {
             var fileName = $"cwl_temp_file_{workflowId}.cwl";
@@ -710,127 +573,9 @@ namespace TesApi.Web
             return false;
         }
 
-        private async Task<string> GetPricingContentJsonAsync()
-        {
-            var pricingUrl = $"https://management.azure.com/subscriptions/{subscriptionId}/providers/Microsoft.Commerce/RateCard?api-version=2016-08-31-preview&$filter=OfferDurableId eq '{azureOfferDurableId}' and Currency eq 'USD' and Locale eq 'en-US' and RegionInfo eq 'US'";
-
-            try
-            {
-                var accessToken = await GetAzureAccessTokenAsync();
-                var pricingRequest = new HttpRequestMessage(HttpMethod.Get, pricingUrl);
-                pricingRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-                var pricingResponse = await httpClient.SendAsync(pricingRequest);
-                var content = await pricingResponse.Content.ReadAsByteArrayAsync();
-                return Encoding.UTF8.GetString(content).TrimStart('\ufeff');
-            }
-            catch (Exception ex)
-            {
-                logger.LogInformation($"GetPricingContentJsonAsync URL: {pricingUrl}");
-                logger.LogError(ex, $"Could not retrieve VM pricing info. Make sure that TES service principal has Billing Reader role on the subscription");
-                throw;
-            }
-        }
-
-        private IEnumerable<VmPrice> ExtractVmPricesFromRateCardResponse(List<(string VmSize, string MeterName, string MeterSubCategory)> supportedVmSizes, string pricingContent)
-        {
-            var rateCardMeters = JObject.Parse(pricingContent)["Meters"]
-                .Where(m => m["MeterCategory"].ToString() == "Virtual Machines" && m["MeterStatus"].ToString() == "Active" && m["MeterRegion"].ToString().Equals(billingRegionName, StringComparison.OrdinalIgnoreCase))
-                .Select(m => new { MeterName = m["MeterName"].ToString(), MeterSubCategory = m["MeterSubCategory"].ToString(), MeterRate = m["MeterRates"]["0"].ToString() })
-                .Where(m => !m.MeterSubCategory.Contains("Windows"))
-                .Select(m => new { 
-                    MeterName = m.MeterName.Replace(" Low Priority", string.Empty, StringComparison.OrdinalIgnoreCase),
-                    m.MeterSubCategory,
-                    MeterRate = decimal.Parse(m.MeterRate), 
-                    IsLowPriority = m.MeterName.Contains(" Low Priority", StringComparison.OrdinalIgnoreCase) })
-                .ToList();
-
-            return supportedVmSizes
-                .Select(v => new {
-                    v.VmSize,
-                    RateCardMeters = rateCardMeters.Where(m => m.MeterName.Equals(v.MeterName, StringComparison.OrdinalIgnoreCase) && m.MeterSubCategory.Equals(v.MeterSubCategory, StringComparison.OrdinalIgnoreCase)) })
-                .Select(v => new VmPrice {
-                    VmSize = v.VmSize,
-                    PricePerHourDedicated = v.RateCardMeters.FirstOrDefault(m => !m.IsLowPriority)?.MeterRate,
-                    PricePerHourLowPriority = v.RateCardMeters.FirstOrDefault(m => m.IsLowPriority)?.MeterRate })
-                .Where(v => v.PricePerHourDedicated is not null);
-        }
-
-        /// <summary>
-        /// Get the price and resource summary of all available VMs in a region for the <see cref="BatchAccount"/>.
-        /// </summary>
-        /// <returns><see cref="VirtualMachineInformation"/> for available VMs in a region.</returns>
-        private async Task<IEnumerable<VirtualMachineInformation>> GetVmSizesAndPricesRawAsync()
-        {
-            static double ConvertMiBToGiB(int value) => Math.Round(value / 1024.0, 2);
-
-            var azureClient = await GetAzureManagementClientAsync();
-
-            var vmSizesAvailableAtLocation = (await azureClient.WithSubscription(subscriptionId).ComputeSkus.ListbyRegionAndResourceTypeAsync(Region.Create(location), ComputeResourceType.VirtualMachines))
-                .Select(vm => new { VmSize = vm.Name.Value, VmFamily = vm.Inner.Family, Capabilities = vm.Capabilities.ToDictionary(c => c.Name, c => c.Value) })
-                .Select(vm => new {
-                    VmSize = vm.VmSize,
-                    VmFamily = vm.VmFamily,
-                    NumberOfCores = int.Parse(vm.Capabilities.GetValueOrDefault("vCPUsAvailable", vm.Capabilities["vCPUs"])),
-                    MemoryGiB = double.Parse(vm.Capabilities["MemoryGB"]),
-                    DiskGiB = ConvertMiBToGiB(int.Parse(vm.Capabilities["MaxResourceVolumeMB"])),
-                    MaxDataDiskCount = int.Parse(vm.Capabilities.GetValueOrDefault("MaxDataDiskCount", "0")) });
-
-            IEnumerable<VmPrice> vmPrices;
-
-            var supportedVmSizes = AzureBillingUtils.GetVmSizesSupportedByBatch().ToList();
-
-            try
-            {
-                var pricingContent = await GetPricingContentJsonAsync();
-                vmPrices = ExtractVmPricesFromRateCardResponse(supportedVmSizes, pricingContent);
-            }
-            catch
-            {
-                logger.LogWarning("Using default VM prices. Please see: https://github.com/microsoft/CromwellOnAzure/blob/master/docs/troubleshooting-guide.md#dynamic-cost-optimization-and-ratecard-api-access");
-                vmPrices = JsonConvert.DeserializeObject<IEnumerable<VmPrice>>(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "DefaultVmPrices.json")));
-            }
-
-            var vmInfos = new List<VirtualMachineInformation>();
-
-            foreach (var (vmSize, _, _) in supportedVmSizes)
-            {
-                var vmSpecification = vmSizesAvailableAtLocation.SingleOrDefault(vm => vm.VmSize.Equals(vmSize, StringComparison.OrdinalIgnoreCase));
-                var vmPrice = vmPrices.SingleOrDefault(vm => vm.VmSize.Equals(vmSize, StringComparison.OrdinalIgnoreCase));
-
-                if (vmSpecification is not null && vmPrice is not null)
-                {
-                    vmInfos.Add(new VirtualMachineInformation
-                    {
-                        VmSize = vmSize,
-                        MemoryInGB = vmSpecification.MemoryGiB,
-                        NumberOfCores = vmSpecification.NumberOfCores,
-                        ResourceDiskSizeInGB = vmSpecification.DiskGiB,
-                        MaxDataDiskCount = vmSpecification.MaxDataDiskCount,
-                        VmFamily = vmSpecification.VmFamily,
-                        LowPriority = false,
-                        PricePerHour = vmPrice.PricePerHourDedicated
-                    });
-
-                    if(vmPrice.LowPriorityAvailable)
-                    {
-                        vmInfos.Add(new VirtualMachineInformation
-                        {
-                            VmSize = vmSize,
-                            MemoryInGB = vmSpecification.MemoryGiB,
-                            NumberOfCores = vmSpecification.NumberOfCores,
-                            ResourceDiskSizeInGB = vmSpecification.DiskGiB,
-                            MaxDataDiskCount = vmSpecification.MaxDataDiskCount,
-                            VmFamily = vmSpecification.VmFamily,
-                            LowPriority = true,
-                            PricePerHour = vmPrice.PricePerHourLowPriority
-                        });
-                    }
-                }
-            }
-
-            // TODO: Check if pricing API did not return the list and vmInfos is null
-            return vmInfos;
-        }
+        /// <inheritdoc />
+        public string GetArmRegion()
+            => location;
 
         private static Task<string> GetAzureAccessTokenAsync(string resource = "https://management.azure.com/")
             => new AzureServiceTokenProvider().GetAccessTokenAsync(resource);
@@ -848,151 +593,21 @@ namespace TesApi.Web
             return azureClient;
         }
 
-        /// <summary>
-        /// Creates an Azure Batch pool that's lifecycle must be manually managed
-        /// </summary>
-        /// <param name="poolName">The name of the pool. This becomes the Pool.Id</param>
-        /// <param name="vmSize">The Azure SKU for the VM of the pool</param>
-        /// <param name="isLowPriority">True if a low-priority VM should be used; false for a dedicated</param>
-        /// <param name="executorImage">The image required by the TesTask</param>
-        /// <param name="nodeInfo">Information about the pool to be created</param>
-        /// <param name="dockerInDockerImageName">Image that contains Docker to download private images</param>
-        /// <param name="blobxferImageName">Image name for blobxfer, the Azure storage transfer tool</param>
-        /// <param name="identityResourceIds">The resource IDs of user-assigned managed identities to assign to the pool</param>
-        /// <param name="disableBatchNodesPublicIpAddress">True to remove the public IP address of the Batch node</param>
-        /// <param name="batchNodesSubnetId">The subnet ID of the Batch VM in the pool</param>
-        /// <param name="startTaskSasUrl">SAS URL for the start task</param>
-        /// <param name="startTaskPath">Local path on the Azure Batch node for the script</param>
-        /// <returns></returns>
-        public async Task<ManualBatchPoolCreationResult> CreateManualBatchPoolAsync(
-            string poolName, 
-            string vmSize, 
-            bool isLowPriority, 
-            string executorImage, 
-            BatchNodeInfo nodeInfo,
-            string dockerInDockerImageName, 
-            string blobxferImageName, 
-            IEnumerable<string> identityResourceIds, 
-            bool disableBatchNodesPublicIpAddress, 
-            string batchNodesSubnetId,
-            string startTaskSasUrl,
-            string startTaskPath
-            )
+        /// <inheritdoc/>
+        public async Task<PoolInformation> CreateBatchPoolAsync(BatchModels.Pool poolInfo, bool isPreemptable)
         {
-            var result = new ManualBatchPoolCreationResult();
-
             try
             {
                 var tokenCredentials = new TokenCredentials(await GetAzureAccessTokenAsync());
-
-                var vmConfigManagement = new Microsoft.Azure.Management.Batch.Models.VirtualMachineConfiguration(
-                    new Microsoft.Azure.Management.Batch.Models.ImageReference(
-                    nodeInfo.BatchImagePublisher,
-                    nodeInfo.BatchImageOffer,
-                    nodeInfo.BatchImageSku,
-                    nodeInfo.BatchImageVersion),
-                    nodeInfo.BatchNodeAgentSkuId);
-
-                Microsoft.Azure.Management.Batch.Models.StartTask startTask = null;
-
-                if (!string.IsNullOrWhiteSpace(startTaskSasUrl) && !string.IsNullOrWhiteSpace(startTaskPath))
-                {
-                    startTask = new Microsoft.Azure.Management.Batch.Models.StartTask
-                    {
-                        CommandLine = $"/bin/sh {startTaskPath}",
-                        UserIdentity = new Microsoft.Azure.Management.Batch.Models.UserIdentity(null, new Microsoft.Azure.Management.Batch.Models.AutoUserSpecification(elevationLevel: Microsoft.Azure.Management.Batch.Models.ElevationLevel.Admin, scope: Microsoft.Azure.Management.Batch.Models.AutoUserScope.Pool)),
-                        ResourceFiles = new List<Microsoft.Azure.Management.Batch.Models.ResourceFile> { new Microsoft.Azure.Management.Batch.Models.ResourceFile(null, null, startTaskSasUrl, null, startTaskPath) }
-                    };
-                }
-
-                var containerRegistryInfo = await GetContainerRegistryInfoAsync(executorImage);
-
-                if (containerRegistryInfo is not null)
-                {
-                    result.PoolHasContainerConfig = true;
-
-                    var containerRegistryMgmt = new Microsoft.Azure.Management.Batch.Models.ContainerRegistry(
-                        userName: containerRegistryInfo.Username,
-                        registryServer: containerRegistryInfo.RegistryServer,
-                        password: containerRegistryInfo.Password);
-
-                    // Download private images at node startup, since those cannot be downloaded in the main task that runs multiple containers.
-                    // Doing this also requires that the main task runs inside a container, hence downloading the "docker" image (contains docker client) as well.
-                    vmConfigManagement.ContainerConfiguration = new Microsoft.Azure.Management.Batch.Models.ContainerConfiguration
-                    {
-                        ContainerImageNames = new List<string> { executorImage, dockerInDockerImageName, blobxferImageName },
-                        ContainerRegistries = new List<Microsoft.Azure.Management.Batch.Models.ContainerRegistry> { containerRegistryMgmt }
-                    };
-
-                    var containerRegistryInfoForDockerInDocker = await GetContainerRegistryInfoAsync(dockerInDockerImageName);
-
-                    if (containerRegistryInfoForDockerInDocker is not null && containerRegistryInfoForDockerInDocker.RegistryServer != containerRegistryInfo.RegistryServer)
-                    {
-                        var containerRegistryForDockerInDockerMgmt = new Microsoft.Azure.Management.Batch.Models.ContainerRegistry(
-                            userName: containerRegistryInfoForDockerInDocker.Username,
-                            registryServer: containerRegistryInfoForDockerInDocker.RegistryServer,
-                            password: containerRegistryInfoForDockerInDocker.Password);
-
-                        vmConfigManagement.ContainerConfiguration.ContainerRegistries.Add(containerRegistryForDockerInDockerMgmt);
-                    }
-
-                    var containerRegistryInfoForBlobXfer = await GetContainerRegistryInfoAsync(blobxferImageName);
-
-                    if (containerRegistryInfoForBlobXfer is not null && containerRegistryInfoForBlobXfer.RegistryServer != containerRegistryInfo.RegistryServer && containerRegistryInfoForBlobXfer.RegistryServer != containerRegistryInfoForDockerInDocker.RegistryServer)
-                    {
-                        var containerRegistryForBlobXferMgmt = new Microsoft.Azure.Management.Batch.Models.ContainerRegistry(
-                            userName: containerRegistryInfoForBlobXfer.Username,
-                            registryServer: containerRegistryInfoForBlobXfer.RegistryServer,
-                            password: containerRegistryInfoForBlobXfer.Password);
-
-                        vmConfigManagement.ContainerConfiguration.ContainerRegistries.Add(containerRegistryForBlobXferMgmt);
-                    }
-                }
-
-                var poolInfo = new Microsoft.Azure.Management.Batch.Models.Pool(name: poolName)
-                {
-                    VmSize = vmSize,
-                    ScaleSettings = new Microsoft.Azure.Management.Batch.Models.ScaleSettings
-                    {
-                        FixedScale = new Microsoft.Azure.Management.Batch.Models.FixedScaleSettings
-                        {
-                            TargetDedicatedNodes = isLowPriority ? 0 : 1,
-                            TargetLowPriorityNodes = isLowPriority ? 1 : 0,
-                            ResizeTimeout = TimeSpan.FromMinutes(30), 
-                            // TODO does this do anything with fixed scale settings?
-                            NodeDeallocationOption = Microsoft.Azure.Management.Batch.Models.ComputeNodeDeallocationOption.TaskCompletion
-                        }
-                    },
-                    DeploymentConfiguration = new Microsoft.Azure.Management.Batch.Models.DeploymentConfiguration
-                    {
-                        VirtualMachineConfiguration = vmConfigManagement
-                    },
-                    Identity = new Microsoft.Azure.Management.Batch.Models.BatchPoolIdentity
-                    {
-                        Type = Microsoft.Azure.Management.Batch.Models.PoolIdentityType.UserAssigned,
-                        UserAssignedIdentities = identityResourceIds.ToDictionary(x => x, x => new Microsoft.Azure.Management.Batch.Models.UserAssignedIdentities())
-                    },
-                    StartTask = startTask
-                };
-
-                if (!string.IsNullOrEmpty(batchNodesSubnetId))
-                {
-                    poolInfo.NetworkConfiguration = new Microsoft.Azure.Management.Batch.Models.NetworkConfiguration
-                    {
-                        PublicIPAddressConfiguration = new Microsoft.Azure.Management.Batch.Models.PublicIPAddressConfiguration(disableBatchNodesPublicIpAddress ? Microsoft.Azure.Management.Batch.Models.IPAddressProvisioningType.NoPublicIPAddresses : Microsoft.Azure.Management.Batch.Models.IPAddressProvisioningType.BatchManaged),
-                        SubnetId = batchNodesSubnetId
-                    };
-                }
-
                 var batchManagementClient = new BatchManagementClient(tokenCredentials) { SubscriptionId = subscriptionId };
-                logger.LogInformation($"Creating manual batch pool named {poolName} with vmSize {vmSize} and low priority {isLowPriority}");
+                logger.LogInformation($"Creating manual batch pool named {poolInfo.Name} with vmSize {poolInfo.VmSize} and low priority {isPreemptable}");
                 var pool = await batchManagementClient.Pool.CreateAsync(batchResourceGroupName, batchAccountName, poolInfo.Name, poolInfo);
-                logger.LogInformation($"Successfully created manual batch pool named {poolName} with vmSize {vmSize} and low priority {isLowPriority}");
-                return result;
+                logger.LogInformation($"Successfully created manual batch pool named {poolInfo.Name} with vmSize {poolInfo.VmSize} and low priority {isPreemptable}");
+                return new() { PoolId = pool.Name };
             }
             catch (Exception exc)
             {
-                logger.LogError(exc, $"Error trying to create manual batch pool named {poolName} with vmSize {vmSize} and low priority {isLowPriority}");
+                logger.LogError(exc, $"Error trying to create manual batch pool named {poolInfo.Name} with vmSize {poolInfo.VmSize} and low priority {isPreemptable}");
                 throw;
             }
         }
@@ -1023,23 +638,12 @@ namespace TesApi.Web
         }
 
         /// <inheritdoc/>
-        public async Task<ContainerRegistryInfo> GetContainerRegistryInfoAsync(string imageName)
-            => (await GetAccessibleContainerRegistriesAsync())
-                .FirstOrDefault(reg => reg.RegistryServer.Equals(imageName.Split('/').FirstOrDefault(), StringComparison.OrdinalIgnoreCase));
-
-        /// <inheritdoc/>
         public async Task<StorageAccountInfo> GetStorageAccountInfoAsync(string storageAccountName)
             => (await GetAccessibleStorageAccountsAsync())
                 .FirstOrDefault(storageAccount => storageAccount.Name.Equals(storageAccountName, StringComparison.OrdinalIgnoreCase));
 
-        private class VmPrice
-        {
-            public string VmSize { get; set; }
-            public decimal? PricePerHourDedicated { get; set; }
-            public decimal? PricePerHourLowPriority { get; set; }
-
-            [JsonIgnore]
-            public bool LowPriorityAvailable => PricePerHourLowPriority is not null;
-        }
+        /// <inheritdoc/>
+        public IAsyncEnumerable<CloudJob> ListJobsAsync(DetailLevel detailLevel = null)
+            => batchClient.JobOperations.ListJobs(detailLevel: detailLevel).ToAsyncEnumerable();
     }
 }

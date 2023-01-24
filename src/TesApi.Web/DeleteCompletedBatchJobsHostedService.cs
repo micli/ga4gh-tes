@@ -7,7 +7,6 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Tes.Extensions;
 using Tes.Models;
 using Tes.Repository;
 
@@ -38,7 +37,6 @@ namespace TesApi.Web
             this.logger = logger;
             this.isDisabled = configuration.GetValue("DisableBatchJobCleanup", false);
         }
-
 
         /// <inheritdoc />
         public override Task StartAsync(CancellationToken cancellationToken)
@@ -96,7 +94,7 @@ namespace TesApi.Web
             logger.LogInformation("Batch Job cleanup gracefully stopped.");
         }
 
-        private async Task DeleteOldBatchJobs(CancellationToken cancellationToken) // TODO: implement
+        private async Task DeleteOldBatchJobs(CancellationToken cancellationToken)
         {
             var jobsToDelete = await azureProxy.ListOldJobsToDeleteAsync(oldestJobAge);
 
